@@ -557,3 +557,148 @@ def test_summary_json_column_is_valid_json(db):
     # summary_json must itself be parseable independently of get_analysis_result's convenience parsing.
     parsed = json.loads(stored["summary_json"])
     assert parsed == {"a": 1, "b": [1, 2, 3]}
+
+
+# ──────────────────────────────────────────────────────────────
+# VERSION STAMP + PRAGMA APPENDIX (append-only; no existing
+# test above was modified)
+# ──────────────────────────────────────────────────────────────
+
+
+def test_p6_fresh_db_stamps_current_version(db):
+    from core.db_migrations import CURRENT_SCHEMA_VERSION
+
+    assert db.get_schema_version() == CURRENT_SCHEMA_VERSION
+
+
+def test_p6_version_survives_reopen(db_path):
+    from core.db_migrations import CURRENT_SCHEMA_VERSION
+
+    db1 = Database(db_path=db_path)
+    db1.close()
+    db2 = Database(db_path=db_path)
+    assert db2.get_schema_version() == CURRENT_SCHEMA_VERSION
+    db2.close()
+
+
+def test_p6_journal_mode_is_delete_and_verified(db):
+    journal = str(db._conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    assert journal == "delete"
+
+
+def test_p6_foreign_keys_enforced(db):
+    fk = int(db._conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    assert fk == 1
+
+
+def test_p6_verify_pragmas_rejects_wrong_settings(db):
+    """_verify_pragmas must raise when the effective settings drift.
+
+    Sabotages one pragma at a time (asserting the sabotage took
+    effect first, so the test can never pass vacuously), then proves
+    the gate raises — the same gate Database.__init__ runs before any
+    trading loop can proceed.
+    """
+    from core.db_migrations import DatabaseSchemaError
+
+    db._conn.execute("PRAGMA foreign_keys=OFF")
+    assert int(db._conn.execute("PRAGMA foreign_keys").fetchone()[0]) == 0
+    with pytest.raises(DatabaseSchemaError, match="foreign_keys"):
+        db._verify_pragmas()
+    db._conn.execute("PRAGMA foreign_keys=ON")
+    db._verify_pragmas()  # gate passes again once settings are restored
+
+    db._conn.execute("PRAGMA busy_timeout=0")
+    assert int(db._conn.execute("PRAGMA busy_timeout").fetchone()[0]) == 0
+    with pytest.raises(DatabaseSchemaError, match="busy_timeout"):
+        db._verify_pragmas()
+
+
+def test_p6_synchronous_is_full_and_verified(db):
+    """Durability choice: synchronous=FULL, so a committed risk-state
+    write (including a latched kill) survives process crash, OS crash,
+    and power loss — not just process crash as NORMAL would give."""
+    sync_row = db._conn.execute("PRAGMA synchronous").fetchone()[0]
+    assert int(sync_row) == 2  # 2 == FULL
+
+
+def test_p6_init_failure_closes_connection(db_path, monkeypatch):
+    """A failed Database() open must not leak its SQLite connection.
+
+    Forces _verify_pragmas to raise after connect() has succeeded,
+    then proves the created connection was closed (a closed
+    connection rejects further use) — and that the original error
+    (not a cleanup artifact) is what propagates to the fail-closed
+    caller.
+    """
+    import sqlite3
+
+    import core.database as db_module
+    from core.db_migrations import DatabaseSchemaError
+
+    created: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        created.append(conn)
+        return conn
+
+    def fail_verify(self):
+        raise DatabaseSchemaError("simulated pragma failure")
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(Database, "_verify_pragmas", fail_verify)
+    with pytest.raises(DatabaseSchemaError, match="simulated pragma failure"):
+        Database(db_path=db_path)
+    assert len(created) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        created[0].execute("SELECT 1")
+
+
+def test_p6_init_failure_close_error_does_not_mask_original(
+    db_path, monkeypatch, caplog
+):
+    """If cleanup itself errors, the original init failure still
+    propagates — close problems are logged, never substituted."""
+    import sqlite3
+
+    import core.database as db_module
+    from core.db_migrations import DatabaseSchemaError
+
+    class _CloseFailingConn:
+        """Forwards everything except close(), which raises."""
+
+        def __init__(self, real: sqlite3.Connection) -> None:
+            object.__setattr__(self, "_real", real)
+
+        def __getattr__(self, name: str):
+            return getattr(object.__getattribute__(self, "_real"), name)
+
+        def __setattr__(self, name: str, value) -> None:
+            setattr(object.__getattribute__(self, "_real"), name, value)
+
+        def __enter__(self):
+            object.__getattribute__(self, "_real").__enter__()
+            return self
+
+        def __exit__(self, *exc_info):
+            return object.__getattribute__(self, "_real").__exit__(*exc_info)
+
+        def close(self) -> None:
+            raise OSError("simulated close failure")
+
+    real_connect = sqlite3.connect
+
+    def failing_close_connect(*args, **kwargs):
+        return _CloseFailingConn(real_connect(*args, **kwargs))
+
+    def fail_verify(self):
+        raise DatabaseSchemaError("original failure")
+
+    monkeypatch.setattr(db_module.sqlite3, "connect", failing_close_connect)
+    monkeypatch.setattr(Database, "_verify_pragmas", fail_verify)
+    with caplog.at_level("WARNING", logger="core.database"):
+        with pytest.raises(DatabaseSchemaError, match="original failure"):
+            Database(db_path=db_path)
+    assert "simulated close failure" in caplog.text
