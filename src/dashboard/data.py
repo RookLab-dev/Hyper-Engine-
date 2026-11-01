@@ -28,6 +28,8 @@ properties, rather than reimplementing that math here.
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Any
 
 from backtester.backtester import BacktestResult
@@ -41,7 +43,16 @@ from backtester.walk_forward import (
 from core.config import settings
 from core.database import Database
 
+logger = logging.getLogger(__name__)
+
 _analyser = PerformanceAnalyser()
+
+# Loop modes whose persisted kill flags are checked by the read-only
+# kill-status view. Must stay identical to
+# execution.smoke_test._SMOKE_CHECK_MODES (same rollover-safe per-mode
+# lookup); the value is repeated here rather than imported so this
+# pure data module never depends on the execution package.
+_KILL_CHECK_MODES = ("paper_trade", "testnet_live_execution", "smoke_test")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -461,4 +472,115 @@ def get_risk_overview(db: Database, session_id: str | None = None) -> dict[str, 
             if configured_daily_loss_cap > 0
             else 0.0
         ),
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# 8. KILL STATUS (observation only — never clears, never writes)
+# ──────────────────────────────────────────────────────────────
+
+
+def get_kill_status(
+    db: Database,
+    symbol: str | None = None,
+    kill_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """
+    Read-only kill-switch snapshot for the API risk view.
+
+    The overall blocked decision reuses execution.smoke_test's
+    kill_block_reason() as the single authority (file first, then each
+    loop mode's database flag — today's row plus the latest prior-day
+    row, so an engaged flag cannot be missed after UTC midnight). The
+    per-representation diagnostics below reuse core.risk_state's
+    read_kill_file() and the existing Database read methods; rows that
+    fail RiskState.from_row() validation are reported with
+    ``corrupt: True`` and their raw stored values, never repaired or
+    coerced. This function never writes to the kill file or the
+    database, never clears anything, and never claims a session is
+    alive.
+
+    Any representation that cannot be read (OSError on the file, any
+    exception on a DB read) is reported as unverifiable — and an
+    unverifiable representation blocks, exactly as the trading loops
+    treat it. A missing file or missing row is "absent" (not engaged),
+    which is distinct from "unverifiable".
+
+    Args:
+        db:        Database instance.
+        symbol:     Asset symbol; defaults to settings.symbol.
+        kill_path: Kill-file location override (tests and operators);
+                   defaults to storage/KILL_SWITCH.
+
+    Returns:
+        Dict with: symbol, day, file {present, reason} or
+        {unverifiable: True}, modes {mode: row-dict | None |
+        {unverifiable: True}}, blocked (bool), block_reason (str|None).
+    """
+    from core.risk_state import (
+        RiskState,
+        default_kill_path,
+        read_kill_file,
+        utc_today,
+    )
+    from execution.smoke_test import kill_block_reason
+
+    resolved_symbol = symbol or settings.symbol
+    day = utc_today()
+    resolved_path = Path(kill_path) if kill_path is not None else default_kill_path()
+
+    try:
+        file_reason = read_kill_file(resolved_path)
+    except OSError as e:
+        logger.error("Kill file unreadable (%s) — reporting unverifiable.", e)
+        file_info: dict[str, Any] = {"unverifiable": True}
+    else:
+        file_info = {"present": file_reason is not None, "reason": file_reason}
+
+    modes: dict[str, Any] = {}
+    for mode in _KILL_CHECK_MODES:
+        try:
+            row = db.load_risk_state(resolved_symbol, mode, day)
+            if row is None:
+                prior = db.load_latest_risk_state_before(resolved_symbol, mode, day)
+                if prior is not None and prior.get("kill_engaged"):
+                    row = dict(prior)
+        except Exception as e:
+            logger.error(
+                "Risk-state read failed (%s/%s) — unverifiable: %s",
+                resolved_symbol,
+                mode,
+                e,
+            )
+            modes[mode] = {"unverifiable": True}
+            continue
+        if row is None:
+            modes[mode] = None
+            continue
+        try:
+            RiskState.from_row(row)
+        except ValueError as e:
+            logger.error("Risk-state row failed validation — reporting corrupt: %s", e)
+            modes[mode] = {"corrupt": True, "row": dict(row)}
+            continue
+        modes[mode] = {
+            "kill_engaged": bool(row.get("kill_engaged")),
+            "kill_reason": row.get("kill_reason"),
+            "realized_loss": row.get("realized_loss"),
+            "open_qty": row.get("open_qty"),
+            "entry_price": row.get("entry_price"),
+            "total_pnl": row.get("total_pnl"),
+            "num_trades": row.get("num_trades"),
+            "session_id": row.get("session_id"),
+            "updated_at": row.get("updated_at"),
+        }
+
+    block_reason = kill_block_reason(resolved_symbol, day, db, kill_path=resolved_path)
+    return {
+        "symbol": resolved_symbol,
+        "day": day,
+        "file": file_info,
+        "modes": modes,
+        "blocked": block_reason is not None,
+        "block_reason": block_reason,
     }
