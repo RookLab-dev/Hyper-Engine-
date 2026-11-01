@@ -1,10 +1,57 @@
-# Hyper-Engine Dashboard
+# Hyper-Engine Dashboards
 
-A **read-only** monitoring and analytics dashboard for Hyper-Engine, built on
-[Streamlit](https://streamlit.io) and the existing SQLite persistence layer
-(`core/database.py`).
+Hyper-Engine provides two read-only interfaces over its persisted trading and analysis data:
 
-## What it displays
+* **Web Dashboard:** React + TypeScript frontend backed by the FastAPI read API.
+* **Streamlit Dashboard:** Existing Python dashboard backed by the SQLite persistence layer.
+
+Neither interface provides controls to place, cancel, or modify orders. The web dashboard accesses data through the API; the Streamlit dashboard reads through the existing database access layer.
+
+## Web Dashboard
+
+The web frontend lives in `web/` and uses React, TypeScript, Vite, and TanStack Query. Its data comes from the FastAPI application in `src/api/`.
+
+### Start the application
+
+From the repository root, start the API:
+
+```bash
+poetry run uvicorn api.main:app --app-dir src --host 127.0.0.1 --port 8000
+```
+
+In another terminal, start the frontend:
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open the local URL printed by Vite. Its development server proxies requests beginning with `/api` to `http://127.0.0.1:8000`.
+
+### Frontend checks
+
+Run these commands from the `web/` directory:
+
+```bash
+npm run typecheck
+npm run lint
+npm run test
+npm run build
+```
+
+The production build is written to `web/dist/`.
+
+### Data freshness and interpretation
+
+The frontend uses polling rather than WebSockets. Freshness therefore depends on the configured polling behavior and API availability.
+
+A session whose `ended_at` value is `null` is an open database record; it is not proof that a trading process is currently running.
+
+The Risk view is for observation, not control. Displayed loss figures derived from persisted trades must not be treated as authoritative risk-enforcement counters.
+
+
+## Streamlit Dashboard: What It Displays
 
 | Page | Data source |
 |---|---|
