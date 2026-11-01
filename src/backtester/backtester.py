@@ -2,37 +2,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 
+from backtester.costs import CostModel
 from strategies.base_strategy import BaseStrategy
+from strategies.protocols import dispatch_signal, is_candle_based
 
 logger = logging.getLogger(__name__)
-
-
-# ──────────────────────────────────────────────────────────────
-# TYPING HELPERS
-# ──────────────────────────────────────────────────────────────
-
-
-@runtime_checkable
-class _CandleBasedStrategy(Protocol):
-    """
-    Structural type for strategies that need full OHLCV data instead of
-    just closes (e.g. VWAPStrategy.generate_signal_from_candles) —
-    used only so mypy can narrow self.strategy's type in
-    _generate_signals() below.
-
-    @runtime_checkable makes isinstance(x, _CandleBasedStrategy) check
-    for the presence of a callable generate_signal_from_candles
-    attribute, i.e. the exact same test hasattr(x,
-    "generate_signal_from_candles") performed before — this is a
-    typing-only change, not a behavior change.
-    """
-
-    def generate_signal_from_candles(self, candles: list[list[float]]) -> str: ...
 
 
 # ──────────────────────────────────────────────────────────────
@@ -42,7 +21,13 @@ class _CandleBasedStrategy(Protocol):
 
 @dataclass
 class Trade:
-    """One completed round-trip trade (buy → sell)."""
+    """One completed round-trip trade (buy → sell).
+
+    pnl is net of costs: net + fee_paid + funding_paid == gross fills
+    PnL, where gross = (exit - entry) * size. fee_paid covers both legs;
+    funding_paid covers the holding period. Slippage lives in the fill
+    prices themselves (see backtester.costs for the full convention).
+    """
 
     entry_time: int
     exit_time: int
@@ -51,6 +36,8 @@ class Trade:
     size: float
     pnl: float
     pnl_pct: float
+    fee_paid: float = 0.0
+    funding_paid: float = 0.0
 
 
 @dataclass
@@ -105,8 +92,15 @@ class Backtester:
         strategy:        Any strategy inheriting from BaseStrategy
         initial_capital: Starting portfolio value in USDC
         position_size:   Size of each trade in base currency
-        slippage_pct:    Slippage as fraction of fill price
+        slippage_pct:    Slippage as fraction of fill price. Used to
+                         build the default CostModel when cost_model is
+                         None — pass cost_model explicitly to configure
+                         fees or funding.
         symbol:          Asset being tested
+        cost_model:      Shared execution-cost model (see
+                         backtester.costs.CostModel). Defaults to
+                         CostModel(slippage_pct=slippage_pct), which
+                         reproduces the historical fill math exactly.
 
     Usage:
         strategy = EMAStrategy(fast_period=9, slow_period=21)
@@ -123,12 +117,18 @@ class Backtester:
         position_size: float = 0.001,
         slippage_pct: float = 0.001,
         symbol: str = "BTC",
+        cost_model: CostModel | None = None,
     ) -> None:
         self.strategy = strategy
         self.initial_capital = initial_capital
         self.position_size = position_size
         self.slippage_pct = slippage_pct
         self.symbol = symbol
+        self.cost_model = (
+            cost_model
+            if cost_model is not None
+            else CostModel(slippage_pct=slippage_pct)
+        )
 
     def run(self, candles: list[list]) -> BacktestResult:
         """
@@ -261,7 +261,12 @@ class Backtester:
         closes = df["close"].tolist()
         signals = []
 
-        use_candles = isinstance(self.strategy, _CandleBasedStrategy)
+        # Conditional (as before P7): the column-ordered candle list is
+        # only built when the strategy actually consumes it. Column
+        # order must match calculate_vwap()'s unpack
+        # (_, _, high, low, close, volume) — do not reorder without
+        # updating the indicator (see P7 audit).
+        use_candles = is_candle_based(self.strategy)
         candles: list[list[float]] | None = (
             df[["timestamp", "open", "high", "low", "close", "volume"]].values.tolist()
             if use_candles
@@ -269,15 +274,13 @@ class Backtester:
         )
 
         for i in range(len(closes)):
-            if (
-                use_candles
-                and candles is not None
-                and isinstance(self.strategy, _CandleBasedStrategy)
-            ):
-                signal = self.strategy.generate_signal_from_candles(candles[: i + 1])
+            if use_candles:
+                assert candles is not None  # narrowed by use_candles above
+                signals.append(
+                    dispatch_signal(self.strategy, candles[: i + 1], closes[: i + 1])
+                )
             else:
-                signal = self.strategy.generate_signal(closes[: i + 1])
-            signals.append(signal)
+                signals.append(dispatch_signal(self.strategy, [], closes[: i + 1]))
 
         df["signal"] = signals
         return df
@@ -287,7 +290,13 @@ class Backtester:
         Simulates trades based on execution signals.
 
         Uses df.itertuples() — faster than iterrows() for row iteration.
-        Slippage applied at fill: buys fill above, sells fill below.
+        Costs applied at fill via self.cost_model (shared with paper
+        trading — see backtester.costs): buys fill above the reference,
+        sells below; per-side fees and holding-period funding are
+        deducted from trade PnL. pnl_pct stays the gross price return
+        (exit - entry) / entry so performance ratios keep their existing
+        meaning; net PnL reconciles as
+        pnl + fee_paid + funding_paid == gross fills PnL.
 
         Position state:
             in_position = False → look for BUY
@@ -297,6 +306,7 @@ class Backtester:
         in_position = False
         entry_price = 0.0
         entry_time = 0
+        entry_fee = 0.0
 
         for row in df.itertuples():
             exec_signal = getattr(row, "exec_signal", None)
@@ -313,13 +323,23 @@ class Backtester:
                 continue
 
             if exec_signal == BaseStrategy.BUY and not in_position:
-                entry_price = fill_price * (1 + self.slippage_pct)
+                entry_price = self.cost_model.buy_fill_price(fill_price)
+                entry_fee = self.cost_model.fee_for_fill(
+                    entry_price, self.position_size
+                )
                 entry_time = ts
                 in_position = True
 
             elif exec_signal == BaseStrategy.SELL and in_position:
-                exit_price = fill_price * (1 - self.slippage_pct)
-                pnl = (exit_price - entry_price) * self.position_size
+                exit_price = self.cost_model.sell_fill_price(fill_price)
+                sell_fee = self.cost_model.fee_for_fill(exit_price, self.position_size)
+                funding = self.cost_model.funding_for_hold(
+                    entry_price * self.position_size, ts - entry_time
+                )
+                fee_paid = entry_fee + sell_fee
+                pnl = (
+                    (exit_price - entry_price) * self.position_size - fee_paid - funding
+                )
                 pnl_pct = (exit_price - entry_price) / entry_price
 
                 trades.append(
@@ -331,24 +351,36 @@ class Backtester:
                         size=self.position_size,
                         pnl=pnl,
                         pnl_pct=pnl_pct,
+                        fee_paid=fee_paid,
+                        funding_paid=funding,
                     )
                 )
                 in_position = False
 
         if in_position and len(df) > 0:
             last = df.iloc[-1]
-            exit_price = float(cast(Any, last["close"])) * (1 - self.slippage_pct)
-            pnl = (exit_price - entry_price) * self.position_size
+            last_ts = int(cast(Any, last["timestamp"]))
+            exit_price = self.cost_model.sell_fill_price(
+                float(cast(Any, last["close"]))
+            )
+            sell_fee = self.cost_model.fee_for_fill(exit_price, self.position_size)
+            funding = self.cost_model.funding_for_hold(
+                entry_price * self.position_size, last_ts - entry_time
+            )
+            fee_paid = entry_fee + sell_fee
+            pnl = (exit_price - entry_price) * self.position_size - fee_paid - funding
             pnl_pct = (exit_price - entry_price) / entry_price
             trades.append(
                 Trade(
                     entry_time=entry_time,
-                    exit_time=int(cast(Any, last["timestamp"])),
+                    exit_time=last_ts,
                     entry_price=entry_price,
                     exit_price=exit_price,
                     size=self.position_size,
                     pnl=pnl,
                     pnl_pct=pnl_pct,
+                    fee_paid=fee_paid,
+                    funding_paid=funding,
                 )
             )
 
