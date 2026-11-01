@@ -19,8 +19,7 @@ Fetch real BTC data from Hyperliquid
 ```
 
 Every session, order, fill, and completed trade — paper or real testnet —
-is persisted to a local SQLite database and browsable in a read-only
-Streamlit dashboard. See [Dashboard](#dashboard) below.
+is persisted to a local SQLite database and browsable in a read-only dashboard. See [Dashboard](#dashboard) below.
 
 ---
 
@@ -36,7 +35,7 @@ src/
 ├── risk/            ← Position sizing, daily loss limits, Kelly criterion
 ├── execution/       ← REAL Hyperliquid TESTNET order execution (explicitly gated)
 ├── core/            ← Config, logging, exceptions, utilities, SQLite persistence
-├── dashboard/       ← Read-only Streamlit monitoring dashboard
+├── dashboard/       ← Read-only monitoring dashboard
 └── strategy_runner.py ← Main pipeline (paper trade OR real testnet execution)
 ```
 
@@ -163,21 +162,47 @@ poetry run mypy src tests
 
 ---
 
-## Dashboard
+## Dashboards
 
-A read-only monitoring dashboard (Streamlit) is available for browsing
-persisted sessions, trades, orders/fills, performance metrics, and stored
-backtest / out-of-sample / walk-forward / Monte Carlo analysis results. It
-never places, cancels, or modifies an order.
+Hyper-Engine provides two read-only interfaces for monitoring persisted trading activity and analysis results.
+
+### Web Dashboard — React + TypeScript
+
+The web dashboard is a React + TypeScript application backed by the FastAPI read API. It provides Overview, Sessions, Trades, Performance, Analysis, Monte Carlo, and Risk views.
+
+The dashboard is for monitoring and reviewing persisted data. It does not provide trading controls.
+
+Start the API from the repository root:
+
+```bash
+poetry run uvicorn api.main:app --app-dir src --host 127.0.0.1 --port 8000
+```
+
+In a second terminal, start the frontend:
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open the local address printed by Vite in your terminal. The development server proxies `/api` requests to the local FastAPI backend.
+
+See [`web/README.md`](web/README.md) for frontend commands and [`docs/dashboard.md`](docs/dashboard.md) for dashboard architecture and data sources.
+
+### Streamlit Dashboard
+
+The existing Streamlit dashboard remains available for browsing persisted sessions, trades, orders and fills, performance metrics, and stored backtest, out-of-sample, walk-forward, and Monte Carlo analysis results.
+
+It is read-only and does not place, cancel, or modify orders.
 
 ```bash
 poetry install --with dashboard
 poetry run streamlit run src/dashboard/app.py
 ```
 
-See [`docs/dashboard.md`](docs/dashboard.md) for the full writeup — what it
-shows, where the data comes from, and how it connects to the SQLite
-persistence layer.
+See [Dashboards](#dashboards) below. for details about the persistence layer and dashboard limitations.
+
 
 ---
 
