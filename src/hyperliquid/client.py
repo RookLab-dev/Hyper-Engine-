@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from core.exceptions import APIError, NetworkError, RateLimitError
 from hyperliquid.auth import HyperliquidAuth
 
 logger = logging.getLogger(__name__)
@@ -16,21 +17,10 @@ DEFAULT_BASE_DELAY = 1.0
 DEFAULT_MAX_DELAY = 30.0
 
 
-class APIError(Exception):
-    """Raised when the API returns a 4xx error. Not retried."""
-
-    def __init__(self, status_code: int, message: str) -> None:
-        self.status_code = status_code
-        self.message = message
-        super().__init__(f"API error {status_code}: {message}")
-
-
-class RateLimitError(APIError):
-    """Raised when the API returns 429 Too Many Requests. Retried with backoff."""
-
-
-class NetworkError(Exception):
-    """Raised on 5xx errors or connection failures. Retried with backoff."""
+# NOTE: APIError, RateLimitError, and NetworkError are the
+# canonical classes from core.exceptions, re-exported here so the
+# existing `hyperliquid.client` and top-level `hyperliquid` import paths
+# keep working unchanged. Do not redefine them locally.
 
 
 class HyperliquidClient:
@@ -231,7 +221,7 @@ class HyperliquidClient:
                 ) from e
 
         if response.status_code == 429:
-            raise RateLimitError(429, "Rate limited — backing off")
+            raise RateLimitError("Rate limited — backing off")
 
         if 400 <= response.status_code < 500:
             try:
