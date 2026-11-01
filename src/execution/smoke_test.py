@@ -20,9 +20,18 @@ Run:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from core.config import settings
 from core.database import Database
+from core.risk_state import (
+    R_KILL_FILE,
+    R_KILL_FLAG,
+    R_UNVERIFIABLE,
+    default_kill_path,
+    read_kill_file,
+    utc_today,
+)
 from core.trade_logger import TradeLogger
 from execution.testnet_executor import (
     TestnetExecutionError,
@@ -40,6 +49,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger("testnet_smoke_test")
 
+# Loop modes whose latched DB kill flags also halt a manual smoke run
+# for the same symbol: a latched kill means "human needed", and manual
+# smoke orders must wait like everything else.
+_SMOKE_CHECK_MODES = ("paper_trade", "testnet_live_execution", "smoke_test")
+
+
+def kill_block_reason(
+    symbol: str,
+    day: str,
+    db: Database,
+    kill_path: str | Path | None = None,
+) -> str | None:
+    """Returns a block reason if any kill representation is engaged for
+    `symbol`, or if risk state is unverifiable; None when clear.
+
+    Checks the global kill file first, then each loop mode's database
+    kill flag — today's row plus the latest prior-day row, so an engaged
+    flag cannot be missed after UTC midnight (rollover-safe). Any engaged
+    representation blocks; any read failure blocks as UNVERIFIABLE. Pure
+    read-only check — the first side effect in main() happens only after
+    this returns None.
+    """
+    try:
+        file_reason = read_kill_file(
+            kill_path if kill_path is not None else default_kill_path()
+        )
+    except OSError:
+        return R_UNVERIFIABLE
+    if file_reason is not None:
+        return f"{R_KILL_FILE}:{file_reason}"
+    for mode in _SMOKE_CHECK_MODES:
+        try:
+            row = db.load_risk_state(symbol, mode, day)
+            if row is None or not row.get("kill_engaged"):
+                prior = db.load_latest_risk_state_before(symbol, mode, day)
+                if prior is not None and prior.get("kill_engaged"):
+                    row = prior
+        except Exception:
+            return R_UNVERIFIABLE
+        if row is not None and row.get("kill_engaged"):
+            return f"{R_KILL_FLAG}:{mode}:{row.get('kill_reason') or 'UNKNOWN'}"
+    return None
+
 
 def main() -> None:
     print("\n" + "=" * 65)
@@ -50,6 +102,21 @@ def main() -> None:
     # 1. Config must be explicitly testnet.
     settings.assert_credentials()
     settings.assert_testnet()
+
+    # 1b. Kill-switch guard: refuse BEFORE any network use or order when
+    # a kill is engaged for this symbol (file or any loop's DB flag), or
+    # when risk state cannot be verified at all.
+    try:
+        smoke_db = Database()
+    except Exception as e:
+        logger.error("Refusing smoke test: risk database unavailable: %s", e)
+        print(f"\nABORTED (unverifiable risk state): {e}\n")
+        return
+    block_reason = kill_block_reason(settings.symbol, utc_today(), smoke_db)
+    if block_reason is not None:
+        logger.error("Refusing smoke test: %s", block_reason)
+        print(f"\nABORTED (kill switch): {block_reason}\n")
+        return
 
     auth = HyperliquidAuth(
         private_key=settings.hl_private_key,
