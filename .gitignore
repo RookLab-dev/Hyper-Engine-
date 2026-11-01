@@ -47,8 +47,16 @@ storage/
 # VSCode
 .vscode/
 
-.ai/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Frontend (web/)
+web/node_modules/
+web/dist/
+
+# Private development instructions
+/.ai/
+/.claude/
+/CLAUDE.md
