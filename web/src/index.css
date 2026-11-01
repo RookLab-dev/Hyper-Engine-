@@ -1,0 +1,20 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, sans-serif; background: #f6f7fb; color: #1a1d23; }
+.shell { display: flex; min-height: 100vh; }
+.nav { width: 220px; padding: 16px; background: #fff; border-right: 1px solid #e5e7eb; }
+.nav a { display: block; margin: 8px 0; color: #2563eb; text-decoration: none; }
+.main { flex: 1; padding: 24px; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 12px 0; }
+.metric { background: #fff; padding: 12px; border-radius: 8px; border: 1px solid #e5e7eb; }
+.metric-label { font-size: 12px; color: #6b7280; }
+.metric-value { font-size: 20px; font-weight: 600; }
+.muted { color: #6b7280; font-size: 13px; }
+.muted.small { font-size: 11px; }
+.error { color: #b91c1c; }
+.empty { color: #6b7280; font-style: italic; }
+table { width: 100%; border-collapse: collapse; background: #fff; }
+th, td { padding: 8px; border-bottom: 1px solid #e5e7eb; text-align: left; }
+.row { cursor: pointer; }
+.row:hover { background: #f3f4f6; }
+.detail { margin-top: 16px; padding: 12px; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; }
+dl dt { font-weight: 600; }
