@@ -39,11 +39,9 @@ EXPECTED_FILES = [
 ]
 
 
-
 def test_expected_source_files_exist() -> None:
     missing = [p for p in EXPECTED_FILES if not (REPO_ROOT / p).is_file()]
     assert not missing, f"documented source files missing: {missing}"
-
 
 
 def test_env_example_safety_flags_present() -> None:
