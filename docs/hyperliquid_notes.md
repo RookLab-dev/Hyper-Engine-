@@ -1,333 +1,539 @@
 # Hyperliquid API Notes
-> Source: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
+
+**Project:** Hyper-Engine, developed under RookLab
+**Purpose:** Reference notes for Hyperliquid exchange integration
+**Primary scope:** HyperCore market data, account information, and trading operations
+
+**Official documentation:** [Hyperliquid API Documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api)
+
+> **Important:** This document is an engineering reference, not a substitute for the current official API documentation. Endpoint behavior, signing requirements, rate limits, supported actions, and error formats can change. Verify details against the official documentation before implementing or modifying exchange interactions.
 
 ---
 
-## What Is Hyperliquid?
+## 1. What Is Hyperliquid?
 
-Hyperliquid is a Layer 1 blockchain built from scratch, optimized for high-performance trading.
-It uses a custom consensus algorithm called **HyperBFT** (inspired by Hotstuff).
+Hyperliquid is a blockchain ecosystem designed for financial applications, including on-chain perpetual futures and spot trading.
 
-**Hyperliquid itself is the L1.** The whole thing is one single blockchain — not a layer on top of anything else.
+Its architecture includes several important components:
 
-Within that L1, state execution is split into two components:
+* **HyperBFT:** The consensus mechanism underlying the Hyperliquid L1.
+* **HyperCore:** The trading system supporting perpetual futures and spot markets.
+* **HyperEVM:** An Ethereum-compatible execution environment integrated with the Hyperliquid ecosystem.
 
-**HyperBFT — the consensus algorithm**
-Not a layer you interact with. It's the engine underneath everything. Inspired by HotStuff. Both the algorithm and the networking stack are optimized from scratch for the demands of this specific chain. It's what gives both components their one-block finality.
+HyperCore and HyperEVM have different responsibilities. HyperCore provides the exchange functionality relevant to Hyper-Engine's current trading focus, while HyperEVM supports smart-contract applications.
 
-**HyperCore — trading component**
-Handles fully on-chain perpetual futures and spot order books. Every order, cancel, trade, and liquidation happens transparently with one-block finality inherited from HyperBFT. Currently supports 200k orders/second.
+### Relevance to Hyper-Engine
 
-**HyperEVM — smart contract component**
-Brings the general-purpose Ethereum-compatible smart contract platform to the Hyperliquid chain. The key point from the docs: HyperEVM can access HyperCore's liquidity and financial primitives as permissionless building blocks. They share the same chain — they're not isolated from each other.
+Hyper-Engine primarily integrates with HyperCore through Hyperliquid's HTTP API.
 
-The correct mental model:
-```
-Hyperliquid L1
-├── consensus:   HyperBFT  (the engine — one-block finality)
-├── component 1: HyperCore (perps + spot order books)
-└── component 2: HyperEVM  (smart contracts, accesses HyperCore primitives)
-```
+The principal API endpoints are:
 
-> **What this means for your work:** You are only touching **HyperCore** via the REST API — the `/info` and `/exchange` endpoints. HyperEVM (smart contracts, Solidity) is completely out of scope for this entire phase.
+* `/info` — information queries.
+* `/exchange` — signed exchange actions.
+
+WebSocket interfaces can provide streaming market and account updates, but their implementation status must be assessed separately from the HTTP integration.
+
+HyperEVM smart-contract development is outside the current scope of the core trading framework unless introduced as a separately approved feature.
 
 ---
 
-## Base URLs
+## 2. Network Endpoints
 
-| Network  | REST                                    | WebSocket                                  |
-|----------|-----------------------------------------|--------------------------------------------|
-| Mainnet  | `https://api.hyperliquid.xyz`           | `wss://api.hyperliquid.xyz/ws`             |
-| Testnet  | `https://api.hyperliquid-testnet.xyz`   | `wss://api.hyperliquid-testnet.xyz/ws`     |
+The standard API base URLs are:
 
-> **Rule:** Always develop and test against testnet first. Never touch mainnet with untested code.
+| Network | HTTP API                              | WebSocket API                          |
+| ------- | ------------------------------------- | -------------------------------------- |
+| Mainnet | `https://api.hyperliquid.xyz`         | `wss://api.hyperliquid.xyz/ws`         |
+| Testnet | `https://api.hyperliquid-testnet.xyz` | `wss://api.hyperliquid-testnet.xyz/ws` |
 
----
+Confirm the current endpoints in the official documentation before use.
 
-## API Structure — Three Areas
+### Development rule
 
-### 1. Info Endpoint — `POST /info`
-- Used to **read** data: market info, user positions, open orders, fills, funding history, etc.
-- **No signature required** — publicly accessible.
-- All requests are `POST` with a JSON body containing a `type` field that identifies what you want.
-- Works for both Perpetuals and Spot.
-- Responses that take a time range only return 500 elements. For larger ranges, paginate by using the last returned timestamp as the next `startTime`.
+Use testnet for exchange-integration development and testing whenever applicable.
 
-Example request body:
-```json
-{ "type": "clearinghouseState", "user": "0x1234...abcd" }
-```
+Do not assume that testnet behavior perfectly reproduces mainnet behavior. Differences in liquidity, account state, market conditions, and execution outcomes can affect results.
 
-Key info endpoints:
-| Type string | What it returns |
-|---|---|
-| `meta` | Universe of perp assets and their indices |
-| `spotMeta` | Universe of spot assets |
-| `clearinghouseState` | User's perp positions, balances, margin |
-| `spotClearinghouseState` | User's spot balances |
-| `openOrders` | User's open orders |
-| `userFills` | User's trade history |
-| `orderStatus` | Status of a specific order by OID or CLOID |
-| `l2Book` | Order book for a given coin |
-| `allMids` | Mid prices for all assets |
-| `fundingHistory` | Historical funding rates |
-
-> **Note:** To look up data for a master account, pass the master account address — not the API wallet address. Using the API wallet address leads to an empty result (common pitfall).
+Hyper-Engine's explicit execution safeguards must remain in place. Documentation work must not enable mainnet execution or weaken existing testnet gates.
 
 ---
 
-### 2. Exchange Endpoint — `POST /exchange`
-- Used to **write**: place orders, cancel orders, transfer funds, withdraw, approve API wallets.
-- **All requests must be signed** with a wallet private key.
-- The request body always has this structure:
+## 3. HTTP API Structure
+
+### 3.1 Information endpoint — `POST /info`
+
+The information endpoint retrieves market, account, and historical data.
+
+Common query types include:
+
+| Query type               | Purpose                                         |
+| ------------------------ | ----------------------------------------------- |
+| `meta`                   | Perpetual market metadata and asset information |
+| `spotMeta`               | Spot market metadata                            |
+| `clearinghouseState`     | Perpetual account state                         |
+| `spotClearinghouseState` | Spot account state                              |
+| `openOrders`             | Open orders for an account                      |
+| `userFills`              | Account trade and fill history                  |
+| `orderStatus`            | Status information for a specified order        |
+| `l2Book`                 | Order-book information for a market             |
+| `allMids`                | Mid-price information for markets               |
+| `fundingHistory`         | Historical funding information                  |
+
+This list is illustrative rather than exhaustive. Consult the current documentation for supported query types and their required fields.
+
+Information queries generally do not require the signed-action format used by `/exchange`. Some account queries require an account address, so the correct address must be supplied.
+
+### Account-address considerations
+
+When querying an account that uses an API wallet or agent wallet, distinguish the trading account from the signing wallet.
+
+Use the account address required by the particular query. Do not assume that an API wallet address is interchangeable with the master account or trading account address.
+
+An empty account response may indicate an incorrect address or an account with no relevant activity. It should not automatically be interpreted as an API failure.
+
+### Historical queries and pagination
+
+Some time-range queries have response-size limits.
+
+When retrieving historical records:
+
+1. Check the documented limit for the specific query.
+2. Inspect the returned timestamps.
+3. Advance the next request using the appropriate cursor or time boundary.
+4. Handle overlapping boundaries and duplicate records.
+5. Stop when the requested interval has been covered or the endpoint indicates there are no more records.
+
+Do not assume that every endpoint uses the same limit or pagination convention.
+
+### Example request body
+
 ```json
 {
-  "action": { ... },
-  "nonce": 1698693262000,
-  "signature": { "r": "0x...", "s": "0x...", "v": 27 }
+  "type": "clearinghouseState",
+  "user": "0x..."
 }
 ```
 
-Key exchange actions:
-| `type` field | What it does |
-|---|---|
-| `order` | Place one or more orders |
-| `cancel` | Cancel one or more orders by OID |
-| `cancelByCloid` | Cancel orders by client order ID |
-| `approveAgent` | Register an API wallet (agent wallet) |
-| `withdraw3` | Initiate a USDC withdrawal |
-| `usdClassTransfer` | Transfer USDC between perp and spot |
-
-**Asset IDs:**
-- Perpetuals: use the index from `meta` universe array (e.g. BTC = 0, ETH = 1, etc.)
-- Spot: use `10000 + index` where index comes from `spotMeta.universe`
-  - Example: PURR/USDC has spot index 0, so use asset `10000`
-
-**Order fields — Time In Force (TIF):**
-- `GTC` — Good Till Canceled (default, rests on book)
-- `ALO` — Add Liquidity Only / Post Only (cancels instead of matching immediately)
-- `IOC` — Immediate Or Cancel (unfilled portion is canceled)
-
-**Client Order ID (cloid):** Optional 128-bit hex string you assign to track your own orders. Example: `0x1234567890abcdef1234567890abcdef`
-
-**`expiresAfter` field:** Optional timestamp (ms). Action is rejected if it arrives after this time. Note: actions that expire due to stale `expiresAfter` consume 5x the normal address-based rate limit.
-
-> **Important:** Subaccounts and vaults do not have private keys. You sign on their behalf using an approved API wallet.
+Use a valid account address in actual requests. The example above is illustrative and does not identify a real account.
 
 ---
 
-### 3. WebSocket — `wss://api.hyperliquid.xyz/ws`
-- Used for **real-time streaming** data: order book updates, trades, user fills, positions.
-- Also supports sending signed actions (same as exchange endpoint but over WebSocket).
+## 4. Exchange endpoint — `POST /exchange`
 
-Subscribe format:
+The exchange endpoint accepts actions that change exchange or account state.
+
+Examples include:
+
+* Placing orders.
+* Cancelling orders.
+* Approving API wallets.
+* Performing supported transfers or withdrawals.
+
+Actions generally require a valid signature constructed according to the specific action's signing rules.
+
+### General request structure
+
+A typical signed request has the following conceptual structure:
+
 ```json
-{ "method": "subscribe", "subscription": { ... } }
+{
+  "action": {},
+  "nonce": 0,
+  "signature": {
+    "r": "0x...",
+    "s": "0x...",
+    "v": 27
+  }
+}
 ```
 
-Subscription snapshots: when you first subscribe to a time-series feed, you receive a snapshot of historical data tagged `isSnapshot: true`. You can ignore these if you already have the data.
+This is a structural illustration, not a complete executable request. The action fields, nonce, signature, and any additional required fields depend on the action being submitted.
 
-WebSocket post requests wrap the normal HTTP payload:
+### Common exchange actions
+
+| Action type        | Purpose                                                  |
+| ------------------ | -------------------------------------------------------- |
+| `order`            | Submit one or more orders                                |
+| `cancel`           | Cancel orders by exchange order ID                       |
+| `cancelByCloid`    | Cancel orders by client order ID                         |
+| `approveAgent`     | Approve an API wallet or agent                           |
+| Transfer actions   | Transfer supported assets between permitted destinations |
+| Withdrawal actions | Initiate supported withdrawals                           |
+
+Action names and payload schemas must be verified against the current official documentation before implementation.
+
+### Order time-in-force options
+
+Common time-in-force values include:
+
+| Value | Meaning                                                  |
+| ----- | -------------------------------------------------------- |
+| `GTC` | Good Till Canceled                                       |
+| `ALO` | Add Liquidity Only, commonly used for post-only behavior |
+| `IOC` | Immediate or Cancel                                      |
+
+Their exact behavior depends on the order configuration and exchange rules. Verify current requirements before relying on a particular order type.
+
+### Client order IDs
+
+A client order ID, commonly called a CLOID, allows an application to associate its own identifier with an exchange order.
+
+Before using CLOIDs:
+
+* Follow the documented format and length constraints.
+* Keep IDs unique where required.
+* Persist the relationship between application IDs and exchange order IDs.
+* Handle retries without accidentally duplicating orders.
+* Use the supported cancellation method when cancelling by CLOID.
+
+### Expiration fields
+
+Some actions support an expiration field such as `expiresAfter`.
+
+An expiration timestamp can cause an action to be rejected if it arrives too late. Its supported actions, timestamp requirements, and rate-limit consequences should be verified in the current documentation.
+
+---
+
+## 5. Asset IDs and Market Metadata
+
+Asset identifiers should be derived from current exchange metadata rather than treated as permanent constants.
+
+### Perpetual markets
+
+Perpetual asset identifiers are associated with entries in the perpetual market universe returned by `meta`.
+
+### Spot markets
+
+Spot asset identifiers use the exchange's spot-market identifier scheme, which differs from the perpetual-market scheme.
+
+The precise identifier should be derived from the current `spotMeta` response and its documented rules.
+
+### Recommended implementation approach
+
+At initialization:
+
+1. Retrieve the required market metadata.
+2. Validate the response structure.
+3. Build a symbol-to-asset mapping.
+4. Handle missing or unexpected symbols explicitly.
+5. Refresh metadata according to the application's lifecycle and the exchange's requirements.
+
+Avoid hardcoding asset indices based on assumptions about market ordering.
+
+A metadata change must not silently cause a symbol to map to the wrong market.
+
+---
+
+## 6. Authentication and Signing
+
+Hyperliquid's signed exchange actions use wallet-based cryptographic signing rather than the conventional API-key-and-secret model used by many centralized exchanges.
+
+Hyper-Engine's authentication implementation includes EIP-712 signing and the signing logic required by the relevant Hyperliquid action types.
+
+### Different signing paths
+
+Not all signed actions use the same payload construction.
+
+The relevant distinctions include:
+
+* L1 action signing for applicable trading actions.
+* User-signed action signing for applicable user-facing actions.
+
+The required scheme depends on the action and its current protocol definition. Never select a signing scheme based solely on the HTTP endpoint.
+
+### L1 action signing and the phantom agent
+
+L1 action signing involves protocol-specific payload construction. Important considerations include:
+
+* Action serialization.
+* Field ordering where required by the protocol.
+* Message hashing.
+* Phantom-agent construction.
+* EIP-712 domain and message fields.
+* Nonce handling.
+
+Small differences in serialization or message construction can produce a signature the exchange rejects.
+
+### User-signed actions
+
+Some user-facing actions use a distinct EIP-712 signing format, including the applicable signature-chain configuration.
+
+Do not assume that the chain ID, domain, or payload fields for one signing scheme are interchangeable with those of another.
+
+### Signing failure checklist
+
+When a signed action fails, check:
+
+1. Whether the correct signing scheme was selected.
+2. Whether the action payload matches the current protocol definition.
+3. Whether serialization and field ordering are correct.
+4. Whether numeric values are represented in the expected format.
+5. Whether the correct account and signing wallet are used.
+6. Whether the nonce is valid.
+7. Whether the EIP-712 domain and chain configuration are correct.
+8. Whether the exchange response identifies a signing error or a different validation failure.
+
+A locally recovered signer address does not, by itself, prove that the exchange will accept the request.
+
+### Security principles
+
+* Keep private keys out of source control.
+* Never log private keys or secret configuration values.
+* Restrict API-wallet permissions where supported.
+* Use separate signing identities when required by the operational design.
+* Do not assume an API wallet has identical permissions to a master wallet.
+* Verify current exchange rules before relying on withdrawal restrictions or other permission boundaries.
+
+---
+
+## 7. Nonces and Replay Protection
+
+Signed actions use nonces to help prevent replay and enforce ordering constraints.
+
+The precise nonce rules depend on the current Hyperliquid protocol and action type.
+
+### Implementation considerations
+
+* Generate nonces according to the documented requirements.
+* Use the required timestamp units where timestamp-based nonces apply.
+* Ensure that the signed payload and outer request use consistent nonce values where required.
+* Account for concurrent processes that share a signing identity.
+* Handle nonce-related rejections explicitly.
+* Avoid blindly resubmitting an action with an unchanged invalid nonce.
+
+A retry must distinguish between an action that was rejected before execution and one whose execution outcome is uncertain.
+
+If a request times out after submission, query the appropriate order or account state before retrying an action that could create a duplicate order.
+
+---
+
+## 8. API Wallets and Agent Wallets
+
+API wallets, also called agent wallets in Hyperliquid documentation, allow an approved signing identity to submit supported actions on behalf of an account.
+
+The exact permission model and supported actions should be verified against current official documentation.
+
+### General considerations
+
+* Keep the master wallet's private key separate from routine application configuration where practical.
+* Use a dedicated signing identity for automated trading when appropriate.
+* Approve the agent through the documented procedure.
+* Use the correct account address for information queries.
+* Protect the agent's private key as a sensitive credential.
+* Understand the agent's current permissions and revocation process.
+
+Do not assume that every API-wallet configuration has the same capabilities or restrictions.
+
+### Operational safeguards
+
+The application should:
+
+* Load credentials from protected configuration.
+* Fail safely when required credentials are absent or invalid.
+* Avoid printing secrets in exceptions and logs.
+* Verify network configuration before any permitted execution.
+* Provide a controlled procedure for rotating or revoking compromised credentials.
+
+---
+
+## 9. Rate Limits
+
+Hyperliquid applies rate limits to API usage. Limits can differ by endpoint, request type, address, and connection.
+
+The exact numerical limits may change and should be checked in the official documentation before deployment.
+
+### Rate-limit engineering
+
+A robust client should:
+
+* Handle HTTP and exchange-level rate-limit responses.
+* Apply bounded retries where appropriate.
+* Use backoff rather than repeatedly retrying immediately.
+* Avoid retrying non-idempotent actions without checking their execution state.
+* Limit unnecessary polling.
+* Batch requests only where supported and appropriate.
+* Track rate-limit errors and request latency.
+* Keep cancellation and emergency procedures in mind when designing request budgets.
+
+### WebSocket considerations
+
+If a WebSocket client is used, account for connection limits, subscription limits, message-rate limits, reconnection behavior, and any documented restrictions on posting actions over the connection.
+
+A working HTTP client does not establish that the application has a reliable streaming implementation.
+
+---
+
+## 10. Order and API Errors
+
+Exchange errors can arise from request validation, market constraints, margin requirements, order state, or operational limits.
+
+Examples of error categories include:
+
+| Error category           | Possible meaning                                                           |
+| ------------------------ | -------------------------------------------------------------------------- |
+| Tick-size validation     | Price does not conform to market precision                                 |
+| Minimum notional         | Order value is below the required minimum                                  |
+| Insufficient margin      | Available margin does not support the order                                |
+| Reduce-only validation   | An order violates reduce-only constraints                                  |
+| Post-only rejection      | A post-only order would match immediately                                  |
+| IOC cancellation         | The order did not execute fully and the remainder was cancelled            |
+| Trigger-price validation | A trigger or conditional-order parameter is invalid                        |
+| Insufficient liquidity   | The requested execution cannot be completed because of available liquidity |
+| Position limit           | The order violates a position or margin-tier constraint                    |
+| Missing order            | The order was not found in the requested state or lookup context           |
+
+These examples are descriptive, not a complete or guaranteed list of current error strings.
+
+### Batched requests
+
+When an action contains multiple orders, inspect the actual response structure rather than assuming every response contains one result per order.
+
+The client should account for:
+
+* Per-order errors.
+* Batch-level validation errors.
+* Partial success where supported.
+* Ambiguous execution outcomes.
+* Orders that were accepted but not filled.
+* Cancellation requests that refer to already-filled or already-cancelled orders.
+
+Do not fabricate individual order outcomes from a batch-level error.
+
+### Execution confirmation
+
+An accepted request is not necessarily a filled order.
+
+For execution paths that require confirmed fills, verify the appropriate exchange state or fill records before taking dependent actions.
+
+For example, if the workflow requires a BUY to fill before a SELL can be submitted, an accepted BUY response alone must not satisfy that requirement.
+
+---
+
+## 11. WebSocket API
+
+Hyperliquid provides a WebSocket interface for supported streaming data and other documented operations.
+
+Depending on the subscription, it can provide market updates and account-related information.
+
+### General subscription structure
+
+A subscription request commonly follows this structure:
+
 ```json
-{ "method": "post", "id": 1, "request": { ... } }
+{
+  "method": "subscribe",
+  "subscription": {}
+}
 ```
 
----
+The subscription object must match the specific channel's documented schema.
 
-## Authentication Deep Dive
+Some channels provide an initial snapshot before subsequent updates. Clients should distinguish initial snapshots from incremental updates where the channel defines that distinction.
 
-### How It Works
-Hyperliquid does **NOT** use API key + secret like centralised exchanges.
-Instead: your **Ethereum wallet address IS your identity**. You sign requests with the wallet's private key.
+### Engineering considerations
 
-There are **two signing schemes**:
+A reliable streaming implementation must account for:
 
-| Scheme | SDK method | Used for |
-|---|---|---|
-| L1 Action signing | `sign_l1_action` | All trading actions (order, cancel, etc.) |
-| User-signed action | `sign_user_signed_action` | User-facing actions (transfers, withdrawals, approving agents) |
+* Connection establishment and closure.
+* Reconnection after network failure.
+* Subscription restoration.
+* Message validation.
+* Initial snapshots and incremental updates.
+* Stale data.
+* Duplicate or out-of-order observations where applicable.
+* Rate and subscription limits.
+* Graceful shutdown.
 
-> **Critical:** These are two different code paths. Mixing them up is one of the most common bugs. Know which one each action requires before writing any signing code.
+WebSocket messages should not be treated as permanently authoritative without considering their freshness and the channel's semantics.
 
-### EIP-712 Structured Data Signing
-All signatures use the **EIP-712** standard (Ethereum typed structured data).
+### Hyper-Engine implementation status
 
-The output signature has three fields:
-```json
-{ "r": "0x...", "s": "0x...", "v": 27 }
-```
+WebSocket support must be described according to the current code and tests. A protocol capability or planned module is not proof that the framework currently uses WebSocket streaming in its primary trading pipeline.
 
-### L1 Action Signing — Phantom Agent
-L1 actions (trading) use a **phantom agent construction**:
-1. The action payload is serialized using **msgpack** (field order matters — wrong order = wrong hash)
-2. A hash is computed from the serialized action
-3. This hash becomes the "phantom agent" — a temporary signing identity
-4. The phantom agent is signed via EIP-712 with chain ID `1337`
-
-### User-Signed Actions
-Actions like transfers and withdrawals are signed directly via EIP-712 using the `signatureChainId` field (e.g. `"0xa4b1"` for Arbitrum, or `"0x66eee"` for Hyperliquid EVM).
-
-### Common Signing Bugs (from official docs)
-1. **Two signing schemes** — using `sign_l1_action` when you should use `sign_user_signed_action` or vice versa
-2. **msgpack field order** — fields must be in the exact right order when serializing for L1 actions
-3. **Trailing zeroes on numbers** — e.g. `1.0` vs `1` can produce a different hash
-4. **Address capitalisation** — always **lowercase** all addresses before signing. Some fields are parsed as bytes and auto-lowercased, others are not.
-5. **Local recover signer succeeds but API rejects** — the payload used for local recovery is constructed from the action and may not match exactly what the API expects
-
-> **Debugging tip:** If you get `"L1 error: User or API Wallet 0x... does not exist"` or a mismatched address, your signature is wrong. Add logging to compare each step against the Python SDK output.
+The React + TypeScript dashboard currently uses the documented API polling approach. Do not describe the dashboard as WebSocket-driven unless that behavior has been implemented and verified.
 
 ---
 
-## Nonces
+## 12. Official SDKs and Reference Implementations
 
-### Why Nonces Exist
-A decentralised exchange must prevent **replay attacks** — someone intercepting a signed transaction and broadcasting it multiple times. Nonces solve this.
+The following repositories are useful references. Check their maintainers, activity, and compatibility before adopting any dependency.
 
-### How Hyperliquid Nonces Work
-- Nonce = **current timestamp in milliseconds** (recommended)
-- The 100 highest nonces are stored per signer address
-- Each new action's nonce must be **within the top 100** of the stored nonces — not necessarily strictly sequential, but it must not reuse a nonce that's already been consumed
-- Nonces are stored **per signer** (i.e. per private key used to sign), not per account address
+| Language   | Repository                                                                          | Notes               |
+| ---------- | ----------------------------------------------------------------------------------- | ------------------- |
+| Python     | [hyperliquid-python-sdk](https://github.com/hyperliquid-dex/hyperliquid-python-sdk) | Official Python SDK |
+| Rust       | [hypersdk](https://github.com/infinitefield/hypersdk)                               | Community project   |
+| TypeScript | [hyperliquid](https://github.com/nktkas/hyperliquid)                                | Community project   |
+| TypeScript | [hyperliquid](https://github.com/nomeida/hyperliquid)                               | Community project   |
 
-### Practical Rules
-- Use `int(time.time() * 1000)` for nonces — millisecond timestamp
-- The nonce in the outer request body **must match** the nonce inside the action object (for actions that include it, like withdrawals)
-- Each trading process or frontend session should use a **separate private key** — because nonces are per signer, parallel processes using the same key will conflict
+SDKs can help cross-check protocol details, but their behavior should not be assumed to match the project's implementation automatically.
 
----
-
-## API Wallets (Agent Wallets)
-
-### What They Are
-API wallets are separate Ethereum keypairs that are **approved to sign on behalf of your master account**.
-
-### Why Use Them (Security)
-- API wallets **cannot withdraw funds** — they can only trade
-- Your master wallet key stays offline/cold
-- If an API wallet key is compromised, the attacker cannot drain your account
-- This is the correct setup for any automated trading bot
-
-### Setup Flow
-1. Generate a new Ethereum keypair (this becomes your API wallet)
-2. Send an `approveAgent` action signed by your **master wallet** to register it
-3. Use the API wallet's private key in your bot's `.env`
-4. Pass the **master account address** (not API wallet address) when querying account data
-
-### Capacity
-- 1 unnamed API wallet per master account
-- Up to 3 named API wallets per master account
-- Up to 2 named agents per subaccount
-
-### When API Wallets Are Pruned
-- The wallet is deregistered
-- An unnamed API wallet is replaced when a new `approveAgent` action is sent for an unnamed wallet
+Hyper-Engine's own tests should verify the exact payloads and safeguards required by its execution path.
 
 ---
 
-## Rate Limits
+## 13. Practical Integration Checklist
 
-### IP-Based Limits (per IP address)
+Before changing or extending the Hyperliquid integration, verify the following.
 
-| Limit | Value |
-|---|---|
-| REST weight per minute | **1200** |
-| Max WebSocket connections | 10 |
-| New WebSocket connections per minute | 30 |
-| WebSocket subscriptions | 1000 |
-| Unique users across user WebSocket subs | 10 |
-| Messages sent to HL per minute (all WS) | 2000 |
-| Inflight post messages (all WS) | 100 |
+### Market data
 
-**Request weights:**
-- Exchange actions (unbatched): weight **1**
-- Exchange actions (batched): weight `1 + floor(batch_length / 40)`
-  - e.g. 79 orders in a batch = weight 2
-- Info `l2Book`, `allMids`, `clearinghouseState`, `orderStatus`, `spotClearinghouseState`, `exchangeStatus`: weight **2**
-- Info `userRole`: weight **60**
-- All other info requests: weight **20**
-- Some endpoints add extra weight per 20 items returned (e.g. `userFills`, `fundingHistory`, `historicalOrders`)
-- Explorer requests: weight **40**
+* [ ] Use the correct endpoint and query type.
+* [ ] Validate the response structure.
+* [ ] Handle empty and malformed responses.
+* [ ] Use current market metadata.
+* [ ] Handle pagination and timestamp boundaries.
+* [ ] Avoid assuming historical data is complete or error-free.
 
-### Address-Based Limits (per wallet address)
-- Starting buffer: **10,000 requests**
-- Ongoing: **1 request per 1 USDC traded** cumulatively since account creation
-  - Example: 100 USDC order value requires 1% fill rate to earn 1 request
-- When rate limited: **1 request every 10 seconds**
-- Cancels get extra headroom: `min(limit + 100_000, limit * 2)` — so you can always cancel open orders even when rate limited
-- Address-based limits apply to **actions only** — not info requests
+### Authentication
 
-### Open Order Limits
-- Default: **1000 open orders** per user
-- Scales: +1 per 5M USDC of volume, capped at **5000**
-- At 1000+ open orders: reduce-only and trigger orders are rejected
+* [ ] Select the correct signing scheme.
+* [ ] Validate payload construction and serialization.
+* [ ] Use the required EIP-712 configuration.
+* [ ] Generate valid nonces.
+* [ ] Keep credentials out of logs and version control.
+* [ ] Verify account and signing-wallet roles.
 
-### Batching Note
-A batched request with `n` orders counts as **1 request** for IP rate limiting but **n requests** for address-based rate limiting.
+### Orders and execution
 
----
+* [ ] Validate symbol-to-asset mappings.
+* [ ] Validate price and quantity precision.
+* [ ] Handle minimum-notional and margin constraints.
+* [ ] Distinguish submission acceptance from confirmed fills.
+* [ ] Handle partial fills and cancellations correctly.
+* [ ] Avoid blind retries when the outcome is uncertain.
+* [ ] Preserve existing testnet execution gates.
+* [ ] Never bypass the approved execution path.
 
-## Error Responses
+### Operations
 
-### Order/Cancel Errors (batched)
-Returned as a vector with the same length as the batch.
-
-| Error | Meaning |
-|---|---|
-| `Tick` | Price not divisible by tick size |
-| `MinTradeNtl` | Order below $10 minimum value |
-| `PerpMargin` | Not enough margin |
-| `ReduceOnly` | Reduce-only order would increase position |
-| `BadAloPx` | Post-only order would have matched immediately |
-| `IocCancel` | IOC order found no resting liquidity |
-| `BadTriggerPx` | Invalid TP/SL price |
-| `MarketOrderNoLiquidity` | No liquidity for market order |
-| `Oracle` | Order price too far from oracle |
-| `PerpMaxPosition` | Position would exceed margin tier limit at current leverage |
-| `InsufficientSpotBalance` | Not enough spot balance (spot only) |
-| `MissingOrder` (cancel) | Order was never placed, already filled, or already canceled |
-
-### Pre-Validation Errors (single error for whole batch)
-Some errors are returned as a single error for the whole batch before individual order processing:
-- Empty batch of orders
-- Non reduce-only TP/SL orders
-- Order too far from reference price
-- Some tick size violations
-
-> **Implementation note:** Always handle the case where a single error is returned for a multi-order batch. When this happens, duplicate the error `n` times before passing to your callback, since the whole batch was rejected for the same reason.
+* [ ] Handle timeouts and rate limits.
+* [ ] Use bounded retry and backoff behavior.
+* [ ] Log relevant failures without exposing secrets.
+* [ ] Verify persistent state before relying on recovered data.
+* [ ] Test against testnet before considering any broader deployment.
+* [ ] Review the current official documentation when protocol details may have changed.
 
 ---
 
-## Asset IDs — How They Work
+## 14. Key Engineering Principles
 
-- **Perpetuals:** integer index in the `universe` array from `meta` response
-  - BTC = 0, ETH = 1, etc.
-- **Spot:** `10000 + index` where index comes from `spotMeta.universe`
-  - PURR/USDC (spot index 0) → asset ID = `10000`
+The most important principles for Hyper-Engine's exchange integration are:
 
-> Always fetch `meta` and `spotMeta` at startup and build a symbol-to-asset-ID map. Never hardcode asset IDs.
-
----
-
-## Official SDKs
-
-| Language | Repo | Maintainer |
-|---|---|---|
-| Python | https://github.com/hyperliquid-dex/hyperliquid-python-sdk | Official |
-| Rust | https://github.com/infinitefield/hypersdk | Community |
-| TypeScript | https://github.com/nktkas/hyperliquid | Community |
-| TypeScript | https://github.com/nomeida/hyperliquid | Community |
+1. **Use current metadata.** Do not rely on permanently hardcoded asset indices.
+2. **Treat signing as protocol-specific.** Different action types may require different payloads and signing schemes.
+3. **Treat nonces carefully.** Retry behavior must account for whether an action may already have been accepted.
+4. **Separate order acceptance from execution.** A successful submission does not prove a fill.
+5. **Validate every response.** Handle both batch-level and individual-order failures where applicable.
+6. **Preserve risk safeguards.** Exchange connectivity must not bypass risk checks or execution gates.
+7. **Protect credentials.** Signing keys and private configuration must remain outside public source control.
+8. **Treat protocol limits as changeable.** Verify current rate limits, order rules, and signing requirements.
+9. **Distinguish planned functionality from implemented functionality.** Documentation must reflect what the code actually does.
+10. **Test incrementally.** Use unit tests, mocked exchange responses, and testnet validation as appropriate.
 
 ---
 
-## Key Gotchas — Things That Will Bite You
+## Reference
 
-1. **Never query account data with the API wallet address** — always use the master account address
-2. **Lowercase all addresses before signing** — capitalisation changes the signature
-3. **msgpack field order matters for L1 actions** — wrong order = wrong hash = wrong signature
-4. **The nonce in the outer body must match the nonce inside the action** (for applicable actions)
-5. **Two signing schemes exist** — `sign_l1_action` and `sign_user_signed_action` — know which one each action needs
-6. **Always fetch `meta` at runtime** — never hardcode asset indices
-7. **Paginate time-range queries** — max 500 elements per response
-8. **Testnet first, always** — testnet URL: `https://api.hyperliquid-testnet.xyz`
+For authoritative and current protocol details, consult the [official Hyperliquid API documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api).
 
----
+Hyper-Engine is developed under RookLab as a trading-systems engineering and research project. Exchange integration, backtesting, and testnet execution are engineering capabilities; they do not guarantee profitability or establish mainnet production readiness.
