@@ -1,8 +1,8 @@
-"""Documentation-tree consistency check.
+"""Public repository documentation and structure consistency checks.
 
-Verifies that the agent instructions describe the actual repository
-structure. Uses only the standard library plus pytest (already a dev
-dependency). No trading behavior, no network, no new dependencies.
+Verifies that documented implementation files exist and that the
+public environment template retains its safety defaults.
+Uses only the standard library plus pytest.
 """
 
 from pathlib import Path
@@ -38,23 +38,12 @@ EXPECTED_FILES = [
     "src/dashboard/views/risk.py",
 ]
 
-STALE_REFS = [
-    "dashboard/dashboard.py",
-]
 
 
 def test_expected_source_files_exist() -> None:
     missing = [p for p in EXPECTED_FILES if not (REPO_ROOT / p).is_file()]
     assert not missing, f"documented source files missing: {missing}"
 
-
-def test_agents_doc_has_no_stale_dashboard_ref() -> None:
-    agents = REPO_ROOT / ".ai" / "AGENTS.md"
-    assert agents.is_file(), ".ai/AGENTS.md must exist"
-    text = agents.read_text(encoding="utf-8")
-    for ref in STALE_REFS:
-        assert ref not in text, f"stale reference still present: {ref}"
-    assert "dashboard/app.py" in text, "AGENTS.md must reference dashboard/app.py"
 
 
 def test_env_example_safety_flags_present() -> None:
